@@ -19,18 +19,23 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - name: Download official SEPOMEX catalog
+      - name: Download uploaded official SEPOMEX catalog
         shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
           set -euo pipefail
-          mkdir -p .tmp
-          curl --fail --location --retry 5 --retry-all-errors \
-            --connect-timeout 30 --max-time 300 \
-            -A 'Mozilla/5.0 (compatible; SEPOMEX-import/1.0)' \
-            'https://www.correosdemexico.gob.mx/datosabiertos/cp/cpdescarga.txt' \
-            -o .tmp/source.bin
+          mkdir -p .tmp/release
+          gh release download sepomex-source-2026-07-09 \
+            --repo "$GITHUB_REPOSITORY" \
+            --pattern '*CPdescarga-2026-07-09.zip.zip' \
+            --dir .tmp/release
+          ASSET="$(find .tmp/release -maxdepth 1 -type f -name '*CPdescarga-2026-07-09.zip.zip' -print -quit)"
+          test -n "$ASSET"
+          cp "$ASSET" .tmp/source.bin
           test -s .tmp/source.bin
           file .tmp/source.bin
+          sha256sum .tmp/source.bin
 
       - name: Normalize, validate and split
         shell: bash
@@ -53,7 +58,7 @@ jobs:
               shutil.rmtree(out)
           out.mkdir(parents=True)
 
-          source_version = 'sepomex-' + datetime.now(timezone.utc).date().isoformat()
+          source_version = 'sepomex-2026-07-09'
           now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
           expected_states = {f'{i:02d}' for i in range(1, 33)}
 
@@ -120,6 +125,14 @@ jobs:
           normalized = list(unique.values())
           postal_codes = {r['postal_code'] for r in normalized}
           state_codes = {r['state_code'] for r in normalized}
+          print(json.dumps({
+              'total_source_rows': len(rows),
+              'valid_unique_rows': len(normalized),
+              'discarded_rows': discarded,
+              'postal_code_count': len(postal_codes),
+              'state_count': len(state_codes),
+              'missing_states': sorted(expected_states - state_codes),
+          }, ensure_ascii=False, indent=2))
           if len(normalized) < 10000 or len(postal_codes) < 1000 or state_codes != expected_states:
               raise SystemExit('Catalog failed national completeness checks')
           if rows and discarded / len(rows) > 0.05:
@@ -144,7 +157,7 @@ jobs:
           metadata = {
               'source_version': source_version,
               'generated_at': now,
-              'source_url': 'https://www.correosdemexico.gob.mx/datosabiertos/cp/cpdescarga.txt',
+              'source_url': 'https://github.com/romanrfhack/testMigration/releases/tag/sepomex-source-2026-07-09',
               'total_source_rows': len(rows),
               'valid_unique_rows': len(normalized),
               'discarded_rows': discarded,
