@@ -1,3 +1,4 @@
+# One-time public-data bridge used to load the official SEPOMEX catalog.
 name: Build SEPOMEX import chunks
 
 on:
@@ -36,11 +37,9 @@ jobs:
         run: |
           set -euo pipefail
           python - <<'PY'
-          import csv
           import hashlib
           import io
           import json
-          import os
           import re
           import shutil
           import zipfile
@@ -65,8 +64,7 @@ jobs:
               for _, elem in ET.iterparse(stream, events=('end',)):
                   if elem.tag.split('}')[-1] != 'table':
                       continue
-                  data = {c.tag.split('}')[-1]: norm(c.text) for c in elem}
-                  yield data
+                  yield {c.tag.split('}')[-1]: norm(c.text) for c in elem}
                   elem.clear()
 
           def rows_from_pipe(text):
@@ -86,17 +84,11 @@ jobs:
                       raise SystemExit('ZIP contains no XML/TXT catalog')
                   name = names[0]
                   with zf.open(name) as fh:
-                      if name.lower().endswith('.xml'):
-                          source_rows = rows_from_xml(fh)
-                          rows = list(source_rows)
-                      else:
-                          text = fh.read().decode('utf-8-sig', errors='replace')
-                          rows = list(rows_from_pipe(text))
+                      rows = list(rows_from_xml(fh)) if name.lower().endswith('.xml') else list(rows_from_pipe(fh.read().decode('utf-8-sig', errors='replace')))
           elif raw.lstrip().startswith(b'<'):
               rows = list(rows_from_xml(io.BytesIO(raw)))
           else:
-              text = raw.decode('utf-8-sig', errors='replace')
-              rows = list(rows_from_pipe(text))
+              rows = list(rows_from_pipe(raw.decode('utf-8-sig', errors='replace')))
 
           unique = {}
           discarded = 0
@@ -128,12 +120,8 @@ jobs:
           normalized = list(unique.values())
           postal_codes = {r['postal_code'] for r in normalized}
           state_codes = {r['state_code'] for r in normalized}
-          if len(normalized) < 10000:
-              raise SystemExit(f'Unsafe row count: {len(normalized)}')
-          if len(postal_codes) < 1000:
-              raise SystemExit(f'Unsafe postal code count: {len(postal_codes)}')
-          if state_codes != expected_states:
-              raise SystemExit(f'Missing states: {sorted(expected_states - state_codes)}')
+          if len(normalized) < 10000 or len(postal_codes) < 1000 or state_codes != expected_states:
+              raise SystemExit('Catalog failed national completeness checks')
           if rows and discarded / len(rows) > 0.05:
               raise SystemExit(f'Too many discarded rows: {discarded}/{len(rows)}')
 
@@ -143,17 +131,13 @@ jobs:
                   return '-1:'
               text = str(value)
               return f'{len(text.encode("utf-8"))}:{text}'
-          row_hashes = []
-          for row in normalized:
-              canonical = ''.join(enc(row[f]) for f in digest_fields)
-              row_hashes.append(hashlib.sha256(canonical.encode('utf-8')).hexdigest())
+          row_hashes = [hashlib.sha256(''.join(enc(row[f]) for f in digest_fields).encode('utf-8')).hexdigest() for row in normalized]
           digest = hashlib.sha256(''.join(sorted(row_hashes)).encode('utf-8')).hexdigest()
 
           chunk_size = 5000
           for index in range(0, len(normalized), chunk_size):
-              chunk = normalized[index:index+chunk_size]
               (out / f'chunk-{index // chunk_size:03d}.json').write_text(
-                  json.dumps(chunk, ensure_ascii=False, separators=(',', ':')),
+                  json.dumps(normalized[index:index+chunk_size], ensure_ascii=False, separators=(',', ':')),
                   encoding='utf-8',
               )
 
