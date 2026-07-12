@@ -1,0 +1,13 @@
+{
+  "source_version": "sepomex-2026-07-09",
+  "generated_at": "2026-07-12T21:31:31.460781Z",
+  "source_url": "https://github.com/romanrfhack/testMigration/releases/tag/sepomex-source-2026-07-09",
+  "total_source_rows": 158589,
+  "valid_unique_rows": 157574,
+  "discarded_rows": 1015,
+  "postal_code_count": 31872,
+  "state_count": 32,
+  "batch_digest": "5b0d37d2e870f1c05ac178dd04213db254bc27b0a38460d35f400012720b3e87",
+  "chunk_size": 5000,
+  "chunk_count": 32
+}
