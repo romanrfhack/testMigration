@@ -1,0 +1,185 @@
+name: Build SEPOMEX import chunks
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - '.github/workflows/sepomex-export.yml'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  export:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Download official SEPOMEX catalog
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p .tmp
+          curl --fail --location --retry 5 --retry-all-errors \
+            --connect-timeout 30 --max-time 300 \
+            -A 'Mozilla/5.0 (compatible; SEPOMEX-import/1.0)' \
+            'https://www.correosdemexico.gob.mx/datosabiertos/cp/cpdescarga.txt' \
+            -o .tmp/source.bin
+          test -s .tmp/source.bin
+          file .tmp/source.bin
+
+      - name: Normalize, validate and split
+        shell: bash
+        run: |
+          set -euo pipefail
+          python - <<'PY'
+          import csv
+          import hashlib
+          import io
+          import json
+          import os
+          import re
+          import shutil
+          import zipfile
+          import xml.etree.ElementTree as ET
+          from datetime import datetime, timezone
+          from pathlib import Path
+
+          src = Path('.tmp/source.bin')
+          out = Path('sepomex-import')
+          if out.exists():
+              shutil.rmtree(out)
+          out.mkdir(parents=True)
+
+          source_version = 'sepomex-' + datetime.now(timezone.utc).date().isoformat()
+          now = datetime.now(timezone.utc).isoformat().replace('+00:00', 'Z')
+          expected_states = {f'{i:02d}' for i in range(1, 33)}
+
+          def norm(value):
+              return re.sub(r'\s+', ' ', str(value or '').strip())
+
+          def rows_from_xml(stream):
+              for _, elem in ET.iterparse(stream, events=('end',)):
+                  if elem.tag.split('}')[-1] != 'table':
+                      continue
+                  data = {c.tag.split('}')[-1]: norm(c.text) for c in elem}
+                  yield data
+                  elem.clear()
+
+          def rows_from_pipe(text):
+              lines = [line for line in text.replace('\ufeff', '').splitlines() if line.strip()]
+              if not lines:
+                  return
+              headers = [norm(x) for x in lines[0].split('|')]
+              for line in lines[1:]:
+                  vals = [norm(x) for x in line.split('|')]
+                  yield {h: vals[i] if i < len(vals) else '' for i, h in enumerate(headers)}
+
+          raw = src.read_bytes()
+          if raw[:2] == b'PK':
+              with zipfile.ZipFile(io.BytesIO(raw)) as zf:
+                  names = [n for n in zf.namelist() if n.lower().endswith(('.xml', '.txt'))]
+                  if not names:
+                      raise SystemExit('ZIP contains no XML/TXT catalog')
+                  name = names[0]
+                  with zf.open(name) as fh:
+                      if name.lower().endswith('.xml'):
+                          source_rows = rows_from_xml(fh)
+                          rows = list(source_rows)
+                      else:
+                          text = fh.read().decode('utf-8-sig', errors='replace')
+                          rows = list(rows_from_pipe(text))
+          elif raw.lstrip().startswith(b'<'):
+              rows = list(rows_from_xml(io.BytesIO(raw)))
+          else:
+              text = raw.decode('utf-8-sig', errors='replace')
+              rows = list(rows_from_pipe(text))
+
+          unique = {}
+          discarded = 0
+          for data in rows:
+              postal = norm(data.get('d_codigo'))
+              settlement = norm(data.get('d_asenta'))
+              municipality = norm(data.get('D_mnpio'))
+              state = norm(data.get('d_estado'))
+              state_code = norm(data.get('c_estado')).zfill(2) if norm(data.get('c_estado')) else ''
+              item = {
+                  'postal_code': postal,
+                  'settlement_name': settlement,
+                  'settlement_type': norm(data.get('d_tipo_asenta')) or None,
+                  'municipality': municipality,
+                  'city': norm(data.get('d_ciudad')) or None,
+                  'state': state,
+                  'state_code': state_code,
+                  'municipality_code': norm(data.get('c_mnpio')) or None,
+                  'source_version': source_version,
+                  'updated_at': now,
+              }
+              key = (postal, settlement, municipality, state)
+              valid = bool(re.fullmatch(r'[0-9]{5}', postal) and settlement and municipality and state and state_code in expected_states)
+              if not valid or key in unique:
+                  discarded += 1
+                  continue
+              unique[key] = item
+
+          normalized = list(unique.values())
+          postal_codes = {r['postal_code'] for r in normalized}
+          state_codes = {r['state_code'] for r in normalized}
+          if len(normalized) < 10000:
+              raise SystemExit(f'Unsafe row count: {len(normalized)}')
+          if len(postal_codes) < 1000:
+              raise SystemExit(f'Unsafe postal code count: {len(postal_codes)}')
+          if state_codes != expected_states:
+              raise SystemExit(f'Missing states: {sorted(expected_states - state_codes)}')
+          if rows and discarded / len(rows) > 0.05:
+              raise SystemExit(f'Too many discarded rows: {discarded}/{len(rows)}')
+
+          digest_fields = ['postal_code','settlement_name','settlement_type','municipality','city','state','state_code','municipality_code','source_version']
+          def enc(value):
+              if value is None:
+                  return '-1:'
+              text = str(value)
+              return f'{len(text.encode("utf-8"))}:{text}'
+          row_hashes = []
+          for row in normalized:
+              canonical = ''.join(enc(row[f]) for f in digest_fields)
+              row_hashes.append(hashlib.sha256(canonical.encode('utf-8')).hexdigest())
+          digest = hashlib.sha256(''.join(sorted(row_hashes)).encode('utf-8')).hexdigest()
+
+          chunk_size = 5000
+          for index in range(0, len(normalized), chunk_size):
+              chunk = normalized[index:index+chunk_size]
+              (out / f'chunk-{index // chunk_size:03d}.json').write_text(
+                  json.dumps(chunk, ensure_ascii=False, separators=(',', ':')),
+                  encoding='utf-8',
+              )
+
+          metadata = {
+              'source_version': source_version,
+              'generated_at': now,
+              'source_url': 'https://www.correosdemexico.gob.mx/datosabiertos/cp/cpdescarga.txt',
+              'total_source_rows': len(rows),
+              'valid_unique_rows': len(normalized),
+              'discarded_rows': discarded,
+              'postal_code_count': len(postal_codes),
+              'state_count': len(state_codes),
+              'batch_digest': digest,
+              'chunk_size': chunk_size,
+              'chunk_count': (len(normalized) + chunk_size - 1) // chunk_size,
+          }
+          (out / 'metadata.json').write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding='utf-8')
+          print(json.dumps(metadata, ensure_ascii=False, indent=2))
+          PY
+
+      - name: Commit generated chunks
+        shell: bash
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git add sepomex-import
+          git commit -m 'data: publish SEPOMEX import chunks [skip ci]'
+          git push
